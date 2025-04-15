@@ -1,0 +1,11 @@
+my_project:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('DB_HOST_PROD') }}"
+      port: "{{ env_var('DB_PORT_PROD') | int }}"
+      user: "{{ env_var('DB_USER_PROD') }}"
+      password: "{{ env_var('DB_PASSWORD_PROD') }}"
+      dbname: "{{ env_var('DB_NAME_PROD') }}"
+      schema: public

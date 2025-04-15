@@ -1,0 +1,15 @@
+version: 2
+sources:
+  - name: raw
+    database: data_mountain
+    schema: public
+    tables:
+      - name: raw_shopify_orders
+      - name: raw_shopify_order_lines
+      - name: raw_shopify_refunds
+      - name: raw_shopify_refund_lines
+      - name: raw_odoo_orders
+      - name: raw_odoo_order_lines
+      - name: raw_odoo_listings
+      - name: raw_odoo_listing_items
+      - name: raw_odoo_products

@@ -1,0 +1,84 @@
+deployments:
+  - name: shopify_order
+    entrypoint: flows/shop_flows/orders/main_orders_flow.py:shopify_orders_flow
+    work_pool:
+      name: default
+    parameters:
+      for_production: true
+    schedule:
+      interval: 1800       # Runs every 1800 seconds (30 minutes)
+    concurrency_limit: 1   # Limit to 1 concurrent run
+    concurrency_options:
+      collision_strategy: ENQUEUE  # Queue new runs if the limit is reached
+
+  - name: shopify_refunds
+    entrypoint: flows/shop_flows/returns/main_return_flow.py:shopify_returns_flow
+    work_pool:
+      name: default
+    parameters:
+      for_production: true
+    schedule:
+      interval: 1800       # Runs every 30 minutes
+    concurrency_limit: 1   # Limit to 1 concurrent run
+    concurrency_options:
+      collision_strategy: ENQUEUE  # Queue new runs if the limit is reached
+  
+  - name: odoo_products_flow
+    entrypoint: flows/odoo_flows/products/main_products_flow.py:odoo_products_flow
+    work_pool:
+      name: default
+    parameters:
+      for_production: true
+    schedule:
+      interval: 1800       # Runs every 30 minutes
+    concurrency_limit: 1   # Limit to 1 concurrent run
+    concurrency_options:
+      collision_strategy: ENQUEUE  # Queue new runs if the limit is reached
+  
+  - name: odoo_orders_flow
+    entrypoint: flows/odoo_flows/orders/main_orders_flow.py:odoo_orders_flow
+    work_pool:
+      name: default
+    parameters:
+      for_production: true
+    schedule:
+      interval: 1800       # Runs every 30 minutes
+    concurrency_limit: 1   # Limit to 1 concurrent run
+    concurrency_options:
+      collision_strategy: ENQUEUE  # Queue new runs if the limit is reached
+
+  - name: odoo_order_lines_flow
+    entrypoint: flows/odoo_flows/order_lines/main_order_lines_flow.py:odoo_order_lines_flow
+    work_pool:
+      name: default
+    parameters:
+      for_production: true
+    schedule:
+      interval: 1800       # Runs every 30 minutes
+    concurrency_limit: 1   # Limit to 1 concurrent run
+    concurrency_options:
+      collision_strategy: ENQUEUE  # Queue new runs if the limit is reached
+
+  - name: odoo_listings_flow
+    entrypoint: flows/odoo_flows/listings/main_listings_flow.py:odoo_listings_flow
+    work_pool:
+      name: default
+    parameters:
+      for_production: true
+    schedule:
+      interval: 1800       # Runs every 30 minutes
+    concurrency_limit: 1   # Limit to 1 concurrent run
+    concurrency_options:
+      collision_strategy: ENQUEUE  # Queue new runs if the limit is reached
+
+  - name: odoo_listing_items_flow
+    entrypoint: flows/odoo_flows/listing_items/main_listing_items_flow.py:odoo_listing_items_flow
+    work_pool:
+      name: default
+    parameters:
+      for_production: true
+    schedule:
+      interval: 1800       # Runs every 30 minutes
+    concurrency_limit: 1   # Limit to 1 concurrent run
+    concurrency_options:
+      collision_strategy: ENQUEUE  # Queue new runs if the limit is reached
