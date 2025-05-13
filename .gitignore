@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+
+# Log files
+*.log
+
+# OS-specific files
+.DS_Store
+
+# Sensitive config
+.env
+
+
+#output files
+output/
+# ignore Python byte-code
+*.pyc
