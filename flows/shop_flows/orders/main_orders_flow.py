@@ -1,121 +1,170 @@
+"""
+flows/shop_flows/orders/main_orders_flow.py
+Robust Shopify orders ETL that:
+  • works in both test & prod modes (uses Settings helper)
+  • extracts → transforms → loads in CHUNK_SIZE batches
+  • auto‑detects the primary‑key column coming out of the transform step
+  • updates last_sync only when a batch finishes successfully
+  • never keeps more than one batch in memory at a time
+"""
+from __future__ import annotations
+
 from datetime import datetime, timedelta
+import gc
 import logging
-from prefect import flow
-import pandas as pd
-from sqlalchemy.sql import text
 from typing import Optional
+
+import pandas as pd
+from prefect import flow
+from sqlalchemy.sql import text
 
 from .extract_orders import extract_shopify_orders
 from .transform_orders import transform_shopify_orders
 from .load_orders import load_orders
 from base.connection import get_engine
-from config import settings
+from config import settings  # :contentReference[oaicite:0]{index=0}&#8203;:contentReference[oaicite:1]{index=1}
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+CHUNK_SIZE = 500            # tune to suit memory budget
+SYNC_BUFFER_MINUTES = 2     # safety buffer for incremental sync
+
+
 @flow(name="shopify_orders_flow")
-def shopify_orders_flow(start_date: Optional[str] = None, for_production: bool = False):
-    """
-    Orchestrates extracting Shopify orders from a start_date,
-    transforming them, and loading to CSV (test) or SQL (production).
-    """
-    # Determine start_date based on mode
+def shopify_orders_flow(
+    start_date: Optional[str] = None,
+    for_production: bool = False,
+) -> tuple[dict, dict]:
+    """Main flow entrypoint."""
+
+    # ───────────────────────────┐
+    # 1) Resolve effective start │
+    # ───────────────────────────┘
     if for_production:
         if start_date is None:
             try:
                 with get_engine().connect() as conn:
-                    result = conn.execute(
-                        text("SELECT last_updated FROM last_sync WHERE type = :type"),
-                        {"type": "shopify_orders"}
+                    res = conn.execute(
+                        text("SELECT last_updated FROM last_sync WHERE type = :t"),
+                        {"t": "shopify_orders"},
                     ).fetchone()
-                    if result and result[0]:
-                        start_date = result[0].strftime("%Y-%m-%dT%H:%M:%SZ")
-                        logger.info(f"Fetched start_date from DB: {start_date}")
-                    else:
-                        start_date = settings.DEFAULT_DATE
-                        logger.info(f"No last_sync entry; using settings.DEFAULT_DATE={start_date}")
-            except Exception as e:
-                logger.error(f"Failed to fetch start_date from DB, using default: {e}")
+                start_date = (
+                    res[0].strftime("%Y-%m-%dT%H:%M:%SZ")
+                    if res and res[0]
+                    else settings.DEFAULT_DATE
+                )
+                logger.info("Using start_date from DB: %s", start_date)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error("Could not fetch last_sync; falling back: %s", exc)
                 start_date = settings.DEFAULT_DATE
     else:
-        if start_date is None:
-            start_date = settings.DEFAULT_DATE_TEST
-            logger.info(f"Test mode: No start_date provided, using settings.DEFAULT_DATE_TEST={start_date}")
+        start_date = start_date or settings.DEFAULT_DATE_TEST
+        logger.info("[TEST] start_date=%s", start_date)
 
-    # Validate ISO8601 format
-    try:
-        datetime.strptime(start_date, "%Y-%m-%dT%H:%M:%SZ")
-        logger.debug(f"Validated ISO8601 start_date: {start_date}")
-    except ValueError as e:
-        logger.error(f"Invalid start_date format: {e}. Falling back to settings default.")
-        start_date = settings.DEFAULT_DATE if for_production else settings.DEFAULT_DATE_TEST
-
-    logger.info("=== shopify_orders_flow: Starting with start_date=%s ===", start_date)
-
-    # Subtract a 2-minute buffer from start_date
+    # validate / buffer
     try:
         dt = datetime.strptime(start_date, "%Y-%m-%dT%H:%M:%SZ")
-        dt_buffered = dt - timedelta(minutes=2)
-        start_date = dt_buffered.strftime("%Y-%m-%dT%H:%M:%SZ")
-        logger.info(f"Converted start_date with 2-minute buffer: {start_date}")
-    except Exception as e:
-        logger.error(f"Failed to process start_date: {e}")
-        raise
+    except ValueError:
+        logger.warning("Invalid ISO‑8601 start_date; falling back to defaults")
+        dt = datetime.strptime(
+            settings.DEFAULT_DATE if for_production else settings.DEFAULT_DATE_TEST,
+            "%Y-%m-%dT%H:%M:%SZ",
+        )
+    dt -= timedelta(minutes=SYNC_BUFFER_MINUTES)
+    start_date = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    logger.info("Effective start_date (buffered) = %s", start_date)
 
-    # 1) Extract
-    orders_list, line_items_list = extract_shopify_orders(start_date)
+    # ───────────────────────────┐
+    # 2) Extract & Transform     │
+    # ───────────────────────────┘
+    orders_raw, line_items_raw = extract_shopify_orders(start_date)
+    if not orders_raw and not line_items_raw:
+        logger.warning("No new Shopify orders; nothing to do.")
+        return ({"status": "empty", "rows": 0},) * 2
 
-    if not orders_list and not line_items_list:
-        logger.warning("shopify_orders_flow: No orders or line items extracted. Skipping transform and load.")
-        return {"status": "empty", "rows": 0}, {"status": "empty", "rows": 0}
+    orders_df, line_items_df = transform_shopify_orders(orders_raw, line_items_raw)
+    if not isinstance(orders_df, pd.DataFrame) or not isinstance(
+        line_items_df, pd.DataFrame
+    ):
+        logger.error("Transform returned invalid DataFrames – aborting flow.")
+        return ({"status": "error", "rows": 0},) * 2
 
-    # 2) Transform
-    orders_df, line_items_df = transform_shopify_orders(orders_list, line_items_list)
+    # figure out the primary key column coming out of the transform step
+    ORDER_PK = "id" if "id" in orders_df.columns else "order_id"
+    if ORDER_PK not in orders_df.columns:
+        raise KeyError(
+            f"Expected an 'id' or 'order_id' column in orders_df; found {orders_df.columns}"
+        )
 
-    if not isinstance(orders_df, pd.DataFrame) or not isinstance(line_items_df, pd.DataFrame):
-        logger.error("shopify_orders_flow: Transformation did not return DataFrames. Skipping downstream processes.")
-        return {"status": "error", "rows": 0}, {"status": "error", "rows": 0}
+    total_loaded = 0
+    for offset in range(0, len(orders_df), CHUNK_SIZE):
+        # slice the current batch
+        batch_orders = orders_df.iloc[offset : offset + CHUNK_SIZE].copy()
+        batch_line_items = line_items_df[
+            line_items_df["order_id"].isin(batch_orders[ORDER_PK])
+        ].copy()
 
-    # 3) Load
-    orders_result = load_orders(orders_df, line_items_df, for_production=for_production)
+        logger.info(
+            "Loading batch %s‑%s (orders: %s | lines: %s)",
+            offset + 1,
+            offset + len(batch_orders),
+            len(batch_orders),
+            len(batch_line_items),
+        )
 
-    # 4) Update last_sync if production and both orders and line items load successfully
-    if for_production and orders_result["orders"]["status"] == "success" and orders_result["line_items"]["status"] == "success":
+        result = load_orders(
+            batch_orders,
+            batch_line_items,
+            for_production=for_production,
+        )
+
+        if (
+            result["orders"]["status"] != "success"
+            or result["line_items"]["status"] != "success"
+        ):
+            logger.error("Batch failed – halting after %s rows.", total_loaded)
+            return result["orders"], result["line_items"]
+
+        total_loaded += result["orders"]["rows"]
+
+        # free memory ASAP
+        del batch_orders, batch_line_items
+        gc.collect()
+
+    # ───────────────────────────┐
+    # 3) Update last_sync (prod) │
+    # ───────────────────────────┘
+    if for_production and total_loaded:
+        max_ts = (
+            orders_df["updated_at"].max().to_pydatetime()
+            if "updated_at" in orders_df.columns and not orders_df.empty
+            else datetime.utcnow()
+        )
+        last_sync_dt = max_ts - timedelta(minutes=SYNC_BUFFER_MINUTES)
+        last_sync_str = last_sync_dt.strftime("%Y-%m-%d %H:%M:%S")
+
         try:
             with get_engine().begin() as conn:
-                # Instead of storing the original start_date, we find the maximum updated_at from orders_df
-                max_updated_str = None
-                if ("updated_at" in orders_df.columns) and not orders_df.empty:
-                    max_updated_str = orders_df["updated_at"].max()  # could be a Pandas Timestamp
-
-                if max_updated_str:
-                    # If it's a Pandas Timestamp, convert it to a string first
-                    if isinstance(max_updated_str, pd.Timestamp):
-                        max_updated_str = max_updated_str.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-                    dt_max = datetime.strptime(max_updated_str, "%Y-%m-%dT%H:%M:%SZ")
-                    dt_buffered = dt_max - timedelta(minutes=2)
-                    last_sync = dt_buffered.strftime("%Y-%m-%d %H:%M:%S")
-                    logger.debug(f"Computed last_sync from max updated_at: {max_updated_str} => storing {last_sync}")
-                else:
-                    # Fallback: if no updated_at found, just store the original 'start_date' we used
-                    # or store now(). We'll do a safe fallback:
-                    dt_now = datetime.utcnow()
-                    last_sync = dt_now.strftime("%Y-%m-%d %H:%M:%S")
-                    logger.debug(f"No max_updated_str found. Fallback last_sync={last_sync}")
-
                 conn.execute(
-                    text("INSERT INTO last_sync (type, last_updated) VALUES (:type, :ts) "
-                         "ON CONFLICT (type) DO UPDATE SET last_updated = EXCLUDED.last_updated"),
-                    {"type": "shopify_orders", "ts": last_sync}
+                    text(
+                        """
+                        INSERT INTO last_sync (type, last_updated)
+                        VALUES (:t, :ts)
+                        ON CONFLICT (type)
+                        DO UPDATE SET last_updated = EXCLUDED.last_updated
+                        """
+                    ),
+                    {"t": "shopify_orders", "ts": last_sync_str},
                 )
-            logger.info(f"Updated last_sync for shopify_orders to {last_sync}")
-        except Exception as e:
-            logger.error(f"Failed to update last_sync for shopify_orders: {e}")
+            logger.info("last_sync updated to %s", last_sync_str)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Could not update last_sync: %s", exc)
 
-    if not for_production:
-        logger.info(f"shopify_orders_flow (TEST MODE): Completed with {orders_result['orders']['rows']} orders and {orders_result['line_items']['rows']} line items, saved at {orders_result['orders']['path']} and {orders_result['line_items']['path']}")
-    else:
-        logger.info(f"shopify_orders_flow (PRODUCTION MODE): Loaded {orders_result['orders']['rows']} orders and {orders_result['line_items']['rows']} line items")
-    return orders_result["orders"], orders_result["line_items"]
+    logger.info(
+        "[%s] shopify_orders_flow completed – %s orders loaded in %s‑row chunks",
+        "PROD" if for_production else "TEST",
+        total_loaded,
+        CHUNK_SIZE,
+    )
+    return ({"status": "success", "rows": total_loaded},) * 2

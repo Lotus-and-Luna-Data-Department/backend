@@ -22,14 +22,21 @@ def _fetch_all_orders(updated_at_min: str, client: ShopifyClient) -> List[dict]:
     since_cursor = None
     logger.info(f"_fetch_all_orders: updated_at >= {updated_at_min}")
 
+    # GraphQL query with sortKey updated to UPDATED_AT
     query = f"""
     query($cursor: String) {{
-      orders(first: 100, after: $cursor, query: "updated_at:>={updated_at_min}") {{
+      orders(
+        first: 100
+        after: $cursor
+        query: "updated_at:>={updated_at_min}"
+        sortKey: UPDATED_AT
+      ) {{
         edges {{
           node {{
             id
             name
             createdAt
+            updatedAt
             refunds(first: 1) {{
               id
               updatedAt
@@ -47,6 +54,9 @@ def _fetch_all_orders(updated_at_min: str, client: ShopifyClient) -> List[dict]:
     batch_number = 0
     max_iterations = 1000
     start_time = time.time()
+
+    # prepare datetime threshold
+    updated_at_min_dt = datetime.strptime(updated_at_min, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=pytz.UTC)
 
     while True:
         batch_number += 1
@@ -66,12 +76,24 @@ def _fetch_all_orders(updated_at_min: str, client: ShopifyClient) -> List[dict]:
                 logger.info(f"Batch {batch_number}: No edges found, ending pagination.")
                 break
 
+            # Enforce updated_at filter client-side
+            filtered = []
             for edge in edges:
                 node = safe_get(edge, 'node', default={})
-                if node:
-                    all_orders.append(node)
+                updated_at_val = safe_get(node, 'updatedAt', default=None)
+                if not updated_at_val:
+                    continue
+                try:
+                    node_dt = datetime.strptime(updated_at_val, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=pytz.UTC)
+                except Exception:
+                    continue
+                if node_dt < updated_at_min_dt:
+                    continue
+                filtered.append(node)
 
-            logger.info(f"Batch {batch_number}: Fetched {len(edges)} orders so far => total {len(all_orders)}")
+            all_orders.extend(filtered)
+            logger.info(f"Batch {batch_number}: Fetched {len(filtered)} orders so far => total {len(all_orders)}")
+
             page_info = safe_get(orders_data, 'pageInfo', default={})
             if not safe_get(page_info, 'hasNextPage', default=False):
                 logger.info(f"Batch {batch_number}: No more pages. Stopping.")
@@ -83,6 +105,7 @@ def _fetch_all_orders(updated_at_min: str, client: ShopifyClient) -> List[dict]:
             if batch_number >= max_iterations:
                 logger.warning("_fetch_all_orders: Max iterations reached; stopping pagination.")
                 break
+
         except Exception as e:
             logger.error(f"Batch {batch_number}: Error during pagination: {e}")
             time.sleep(2)
@@ -90,7 +113,6 @@ def _fetch_all_orders(updated_at_min: str, client: ShopifyClient) -> List[dict]:
 
     logger.info(f"_fetch_all_orders: Completed, total fetched={len(all_orders)}")
     return all_orders
-
 
 def _filter_orders_with_refunds(
     orders: List[dict], updated_at_min: str
