@@ -1,5 +1,3 @@
-# flows/shopify_flows/orders/extract_orders.py
-
 import logging
 import json
 import time
@@ -164,7 +162,7 @@ def extract_shopify_orders(start_date: str) -> Tuple[List[dict], List[dict]]:
     batch_number = 0
     since_cursor = None
 
-    logger.info(f"Using filter: created_at >= {start_date}")
+    logger.info(f"Using filter: updated_at >= {start_date}")
     filter_dt = datetime.strptime(start_date, '%Y-%m-%dT%H:%M:%SZ')
 
     # GraphQL query with relevant filtering
@@ -173,8 +171,8 @@ def extract_shopify_orders(start_date: str) -> Tuple[List[dict], List[dict]]:
       orders(
         first: 100
         after: $cursor
-        query: "NOT (financial_status:voided OR financial_status:pending OR financial_status:authorized) created_at:>={start_date}"
-        sortKey: CREATED_AT
+        query: "NOT (financial_status:voided OR financial_status:pending OR financial_status:authorized) updated_at:>={start_date}"
+        sortKey: UPDATED_AT
       ) {{
         edges {{
           node {{
@@ -328,35 +326,25 @@ def extract_shopify_orders(start_date: str) -> Tuple[List[dict], List[dict]]:
                 logger.info("Batch %d: No edges found, ending pagination.", batch_number)
                 break
 
-            created_ats_this_batch = []
+            # Enforce updated_at filter
+            valid_edges = []
             for edge in edges:
                 node = safe_get(edge, 'node', default={})
-                if not node:
-                    logger.warning("Batch %d: Skipping empty node.", batch_number)
+                updated_at_val = safe_get(node, 'updatedAt', default=None)
+                if not updated_at_val:
                     continue
+                updated_at_dt = datetime.strptime(updated_at_val, '%Y-%m-%dT%H:%M:%SZ')
+                if updated_at_dt < filter_dt:
+                    continue
+                valid_edges.append(edge)
 
-                created_at_val = safe_get(node, 'createdAt', default=None)
-                if created_at_val:
-                    created_at_dt = datetime.strptime(created_at_val, '%Y-%m-%dT%H:%M:%SZ')
-                    # Enforce start_date filter
-                    if created_at_dt < filter_dt:
-                        #logger.debug("Batch %d: Skipping order older than %s", batch_number, start_date)
-                        continue
-                    created_ats_this_batch.append(created_at_val)
-
-                # Extract order data + line items
+            for edge in valid_edges:
+                node = safe_get(edge, 'node', default={})
                 orders_list.append(_extract_order_data(node))
                 line_items_list.extend(_extract_line_item_data(node))
 
-            if created_ats_this_batch:
-                min_created = min(created_ats_this_batch)
-                max_created = max(created_ats_this_batch)
-                logger.info("Batch %d: Orders from %s to %s", batch_number, min_created, max_created)
-            else:
-                logger.debug("Batch %d: No createdAt in this batch", batch_number)
-
-            total_fetched += len(edges)
-            logger.info("Batch %d: Fetched %d orders; total so far: %d", batch_number, len(edges), total_fetched)
+            total_fetched += len(valid_edges)
+            logger.info("Batch %d: Fetched %d orders; total so far: %d", batch_number, len(valid_edges), total_fetched)
 
             page_info = safe_get(orders_data, 'pageInfo', default={})
             has_next = safe_get(page_info, 'hasNextPage', default=False)
@@ -365,7 +353,6 @@ def extract_shopify_orders(start_date: str) -> Tuple[List[dict], List[dict]]:
                 break
 
             since_cursor = safe_get(page_info, 'endCursor')
-            logger.debug("Batch %d", batch_number)
             logger.info("Elapsed time so far: %.2f seconds", time.time() - start_time)
 
         except Exception as e:

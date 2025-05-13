@@ -1,7 +1,7 @@
 CREATE TABLE IF NOT EXISTS raw_odoo_orders (
     order_id TEXT PRIMARY KEY,
     create_date TIMESTAMP,
-    last_updated TIMESTAMP,        
+    last_updated TIMESTAMP,
     sales_date TIMESTAMP,
     date_order TIMESTAMP,
     delivery_date TIMESTAMP,
@@ -14,5 +14,7 @@ CREATE TABLE IF NOT EXISTS raw_odoo_orders (
     invoice_status TEXT,
     customer TEXT,
     shipping_policy TEXT,
+    channel TEXT,             
+    delivery_status TEXT,     
     ingested_at TIMESTAMP DEFAULT NOW()
 );
